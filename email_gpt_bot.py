@@ -9,19 +9,18 @@ import openai
 from dotenv import load_dotenv
 import logging
 
-# Load .env if running locally
+# Load .env if testing locally
 load_dotenv()
 
 # === Config ===
 EMAIL_ADDRESS = os.getenv("EMAIL")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 openai.api_key = OPENAI_API_KEY
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 
+# === Fetch latest unread email ===
 def fetch_latest_email():
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
@@ -40,7 +39,6 @@ def fetch_latest_email():
     sender = parseaddr(message["From"])[1]
     subject = message["Subject"] or "(No Subject)"
 
-    # Extract plain text body
     body = ""
     if message.is_multipart():
         for part in message.walk():
@@ -52,21 +50,20 @@ def fetch_latest_email():
 
     return sender, subject, body
 
+# === Generate a reply using GPT-4 ===
 def generate_gpt_reply(body_text):
-    prompt = f"""
-You are a polite and professional assistant replying to a website contact form submission.
-Respond thoughtfully to this message:
-
-"{body_text}"
-    """
-    response = openai.Completion.create(
-        engine="text-davinci-003",
-        prompt=prompt,
-        max_tokens=200,
-        temperature=0.7
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a polite and professional assistant replying to website contact form messages."},
+            {"role": "user", "content": body_text}
+        ],
+        temperature=0.7,
+        max_tokens=300
     )
-    return response.choices[0].text.strip()
+    return response.choices[0].message["content"].strip()
 
+# === Send the reply email ===
 def send_email_reply(recipient, subject, message_text):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = "Re: " + subject
@@ -74,10 +71,8 @@ def send_email_reply(recipient, subject, message_text):
     msg["To"] = recipient
 
     plain_part = MIMEText(message_text, "plain")
-
-    # ✅ Fix: Avoid backslash inside f-string expression
-    formatted_html = message_text.replace("\n", "<br>")
-    html_part = MIMEText(f"<html><body><p>{formatted_html}</p></body></html>", "html")
+    html_content = message_text.replace("\n", "<br>")
+    html_part = MIMEText(f"<html><body><p>{html_content}</p></body></html>", "html")
 
     msg.attach(plain_part)
     msg.attach(html_part)
@@ -87,6 +82,7 @@ def send_email_reply(recipient, subject, message_text):
     server.sendmail(EMAIL_ADDRESS, recipient, msg.as_string())
     server.quit()
 
+# === Main ===
 def main():
     logging.info("Checking for new emails...")
     email_data = fetch_latest_email()
