@@ -1,385 +1,278 @@
+import os
+import time
 import imaplib
 import email
 import smtplib
+import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import os
-import json
+from datetime import datetime, timedelta
 import logging
-from datetime import datetime
 import openai
-import time
-import re
-from bs4 import BeautifulSoup
 
-# Setup logging
+# Import environment loader for local development
+from load_env import load_environment
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='email_bot.log'
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger('email_bot')
 
-class AIFormSubmitEmailBot:
-    def __init__(self):
-        """Initialize the email bot with configuration from environment variables."""
-        self.config = self._load_config()
-        self.processed_ids_file = 'processed_emails.json'
-        self.processed_ids = self._load_processed_ids()
+# Email configuration
+EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS')
+EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD')
+IMAP_SERVER = 'imap.gmail.com'
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT = 587
+
+# OpenAI configuration
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+openai.api_key = OPENAI_API_KEY
+
+def connect_to_inbox():
+    """Connect to the email inbox"""
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+        mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        mail.select('inbox')
+        return mail
+    except Exception as e:
+        logger.error(f"Error connecting to inbox: {e}")
+        return None
+
+def get_unread_emails(mail, hours_ago=24):
+    """Get unread emails from the last specified hours"""
+    if not mail:
+        return []
+    
+    # Calculate the date from hours ago
+    date_since = (datetime.now() - timedelta(hours=hours_ago)).strftime("%d-%b-%Y")
+    
+    try:
+        # Search for unread emails since the specified date
+        result, data = mail.search(None, '(UNSEEN)', f'(SINCE {date_since})')
         
-        # Initialize OpenAI client
-        openai.api_key = self.config['openai_api_key']
-
-    def _load_config(self):
-        """Load configuration from environment variables."""
-        try:
-            config = {
-                # Email server settings
-                'imap_server': os.environ.get('IMAP_SERVER'),
-                'imap_port': int(os.environ.get('IMAP_PORT', 993)),
-                'smtp_server': os.environ.get('SMTP_SERVER'),
-                'smtp_port': int(os.environ.get('SMTP_PORT', 587)),
-                
-                # Email credentials
-                'email_address': os.environ.get('EMAIL_ADDRESS'),
-                'password': os.environ.get('EMAIL_PASSWORD'),
-                
-                # FormSubmit settings
-                'formsubmit_identifier': os.environ.get('FORMSUBMIT_IDENTIFIER', 'FormSubmit'),
-                'auto_reply_subject': os.environ.get('AUTO_REPLY_SUBJECT', 'Thank you for contacting us'),
-                
-                # OpenAI settings
-                'openai_api_key': os.environ.get('OPENAI_API_KEY'),
-                'ai_model': os.environ.get('AI_MODEL', 'gpt-4o'),
-                'response_tone': os.environ.get('RESPONSE_TONE', 'friendly and professional'),
-                
-                # Company info
-                'company_info': {
-                    'name': os.environ.get('COMPANY_NAME', 'Our Company'),
-                    'description': os.environ.get('COMPANY_DESCRIPTION', 'company that values your inquiry'),
-                    'team_name': os.environ.get('TEAM_NAME', 'Customer Support Team')
-                }
-            }
-            
-            # Verify required fields
-            required_fields = ['imap_server', 'smtp_server', 'email_address', 'password', 'openai_api_key']
-            missing_fields = [field for field in required_fields if not config[field]]
-            
-            if missing_fields:
-                raise ValueError(f"Missing required environment variables: {', '.join(missing_fields)}")
-                
-            return config
-            
-        except Exception as e:
-            logger.error(f"Error loading configuration from environment variables: {str(e)}")
-            raise
-
-    def _load_processed_ids(self):
-        """Load previously processed email IDs from JSON file."""
-        try:
-            if os.path.exists(self.processed_ids_file):
-                with open(self.processed_ids_file, 'r') as f:
-                    return json.load(f)
+        if result != 'OK':
+            logger.warning(f"No messages found or search failed: {result}")
             return []
-        except Exception as e:
-            logger.error(f"Error loading processed email IDs: {str(e)}")
-            return []
-
-    def _save_processed_ids(self):
-        """Save processed email IDs to JSON file."""
-        try:
-            with open(self.processed_ids_file, 'w') as f:
-                json.dump(self.processed_ids, f)
-        except Exception as e:
-            logger.error(f"Error saving processed email IDs: {str(e)}")
-
-    def _extract_form_data_from_html(self, html_content):
-        """Extract form data from FormSubmit's HTML table format."""
-        form_data = {}
-        sender_email = None
-        sender_name = None
-        message_content = None
         
-        try:
-            # Parse HTML
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Look for table rows
-            rows = soup.find_all('tr')
-            
-            if not rows:
-                # If no table is found, try to find simple text patterns
-                logger.info("No HTML table found, searching for text patterns")
+        email_ids = data[0].split()
+        logger.info(f"Found {len(email_ids)} unread messages")
+        
+        emails = []
+        for email_id in email_ids:
+            result, message_data = mail.fetch(email_id, '(RFC822)')
+            if result != 'OK':
+                continue
                 
-                # Look for email
-                email_match = re.search(r'email[:\s]+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', html_content)
-                if email_match:
-                    sender_email = email_match.group(1).strip()
-                    form_data['email'] = sender_email
-                    
-                # Look for name
-                name_match = re.search(r'name[:\s]+([^\n]+)', html_content)
-                if name_match:
-                    sender_name = name_match.group(1).strip()
-                    form_data['name'] = sender_name
-                    
-                # Look for message
-                message_match = re.search(r'message[:\s]+([^\n]+)', html_content)
-                if message_match:
-                    message_content = message_match.group(1).strip()
-                    form_data['message'] = message_content
-                    
-                return form_data, sender_email, sender_name, message_content
+            raw_email = message_data[0][1]
+            msg = email.message_from_bytes(raw_email)
             
-            # Process each table row
-            for row in rows:
-                # Find all cells in this row
-                cells = row.find_all('td')
-                
-                # Check if we have at least two cells (field name and value)
-                if len(cells) >= 2:
-                    field_name = cells[0].get_text().strip().lower()
-                    field_value = cells[1].get_text().strip()
-                    
-                    # Store in form data
-                    form_data[field_name] = field_value
-                    
-                    # Extract specific fields of interest
-                    if field_name == 'email':
-                        sender_email = field_value
-                    elif field_name in ('name', 'fullname', 'full name'):
-                        sender_name = field_value
-                    elif field_name in ('message', 'content', 'comment'):
-                        message_content = field_value
+            # Extract email details
+            subject = msg['subject']
+            from_address = msg['from']
+            date = msg['date']
             
-            # If no fields were found with the expected names, try to locate by position
-            if not sender_email and len(form_data) >= 3:
-                keys = list(form_data.keys())
-                # Typically the email field is one of the first few fields
-                for key in keys[:5]:
-                    value = form_data[key]
-                    if '@' in value and '.' in value:
-                        sender_email = value
+            # Get email body
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+                    
+                    if content_type == "text/plain" and "attachment" not in content_disposition:
+                        body = part.get_payload(decode=True).decode()
                         break
+            else:
+                body = msg.get_payload(decode=True).decode()
             
-            # If still no message content, use all form data as context
-            if not message_content:
-                message_content = "Form submission with fields: " + ", ".join([f"{k}: {v}" for k, v in form_data.items()])
-                
-            logger.info(f"Extracted fields: {form_data.keys()}")
-            return form_data, sender_email, sender_name, message_content
-            
-        except Exception as e:
-            logger.error(f"Error parsing HTML form data: {str(e)}")
-            return {}, None, None, None
-
-    def _generate_ai_response(self, name, message_content, form_data):
-        """Generate a personalized response using AI."""
-        try:
-            # Create prompt with context
-            prompt = f"""You are an AI assistant representing {self.config['company_info']['name']}, a {self.config['company_info']['description']}. 
-            
-Write a {self.config['response_tone']} response email to a website visitor who submitted a contact form.
-
-Visitor's name: {name or 'Unknown'}
-Visitor's message: "{message_content}"
-
-Additional form fields: {json.dumps(form_data)}
-
-Your response should:
-1. Be professional and helpful
-2. Acknowledge their specific inquiry
-3. Provide relevant information based on their message
-4. Include a signature as from the {self.config['company_info']['team_name']}
-
-Keep the response concise (150-200 words maximum).
-"""
-
-            # Make API call with retry mechanism
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    response = openai.ChatCompletion.create(
-                        model=self.config['ai_model'],
-                        messages=[
-                            {"role": "system", "content": "You are a helpful assistant that writes professional email responses."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        max_tokens=500,
-                        temperature=0.7,
-                    )
-                    
-                    ai_response = response.choices[0].message.content.strip()
-                    logger.info(f"Successfully generated AI response (length: {len(ai_response)})")
-                    return ai_response
-                    
-                except (openai.error.RateLimitError, openai.error.APIConnectionError) as e:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5  # Exponential backoff
-                        logger.warning(f"API error: {str(e)}. Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                    else:
-                        logger.error(f"Failed to generate AI response after {max_retries} attempts: {str(e)}")
-                        # Fall back to default template
-                        return self._get_default_response(name)
-                        
-                except Exception as e:
-                    logger.error(f"Error generating AI response: {str(e)}")
-                    return self._get_default_response(name)
-                    
-        except Exception as e:
-            logger.error(f"Error in AI response generation: {str(e)}")
-            return self._get_default_response(name)
-
-    def _get_default_response(self, name):
-        """Generate a default response when AI fails."""
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        name_greeting = name if name else "there"
+            # Check if this is a contact form submission
+            if "New Silicon Computers Contact Form Submission" in subject:
+                emails.append({
+                    'id': email_id,
+                    'subject': subject,
+                    'from': from_address,
+                    'date': date,
+                    'body': body
+                })
         
-        return f"""Dear {name_greeting},
+        return emails
+    except Exception as e:
+        logger.error(f"Error fetching emails: {e}")
+        return []
 
-Thank you for contacting {self.config['company_info']['name']} on {current_date}. We have received your inquiry and will get back to you with a detailed response shortly.
+def parse_contact_form_email(email_body):
+    """Parse the contact form email to extract relevant information"""
+    # Initialize data dictionary
+    data = {
+        'name': '',
+        'email': '',
+        'company': '',
+        'phone': '',
+        'subject': '',
+        'message': ''
+    }
+    
+    # Simple parsing based on expected format from FormSubmit
+    lines = email_body.split('\n')
+    current_field = None
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Skip empty lines
+        if not line:
+            continue
+            
+        # Check if this is a field header
+        if ':' in line and line.split(':', 1)[0].strip() in ['Name', 'Email', 'Company', 'Phone', 'Subject', 'Message']:
+            parts = line.split(':', 1)
+            field = parts[0].strip().lower()
+            value = parts[1].strip() if len(parts) > 1 else ''
+            
+            if field in data:
+                data[field] = value
+                current_field = field
+        elif current_field == 'message':
+            # Append to message if we're in the message field
+            data['message'] += '\n' + line
+    
+    return data
+
+def generate_ai_response(contact_data):
+    """Generate an AI response using OpenAI"""
+    try:
+        # Create a prompt for the AI
+        prompt = f"""Generate a professional and friendly email response to a website contact form submission with the following details:
+        
+        Name: {contact_data['name']}
+        Email: {contact_data['email']}
+        Company: {contact_data['company']}
+        Phone: {contact_data['phone']}
+        Subject: {contact_data['subject']}
+        Message: {contact_data['message']}
+        
+        The response should:
+        1. Thank them for contacting Silicon Computers
+        2. Acknowledge their specific inquiry
+        3. Provide a brief, helpful response that shows we understand their needs
+        4. Mention that a team member will follow up with more detailed information soon
+        5. Include a professional sign-off
+        
+        Format the response as plain text suitable for an email body.
+        """
+        
+        # Call the OpenAI API
+        response = openai.ChatCompletion.create(
+            model="gpt-4",  # or another appropriate model
+            messages=[
+                {"role": "system", "content": "You are a professional customer service representative for Silicon Computers, a company that specializes in custom software development, IT consulting, and technology solutions."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        # Extract the generated response
+        ai_response = response.choices[0].message.content.strip()
+        return ai_response
+    except Exception as e:
+        logger.error(f"Error generating AI response: {e}")
+        # Fallback response in case of API failure
+        return f"""Dear {contact_data['name']},
+
+Thank you for contacting Silicon Computers. We have received your inquiry and a member of our team will get back to you shortly.
 
 Best regards,
-The {self.config['company_info']['team_name']}
-{self.config['company_info']['name']}
+The Silicon Computers Team
 """
 
-    def check_emails(self):
-        """Check for new FormSubmit emails and respond to them using AI."""
-        logger.info("Starting email check process with AI response generation")
+def send_email_response(to_email, name, ai_response):
+    """Send an email response"""
+    try:
+        # Create message container
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_ADDRESS
+        msg['To'] = to_email
+        msg['Subject'] = f"Thank you for contacting Silicon Computers, {name}"
         
-        try:
-            # Connect to IMAP server
-            mail = imaplib.IMAP4_SSL(self.config['imap_server'], self.config['imap_port'])
-            mail.login(self.config['email_address'], self.config['password'])
-            mail.select('inbox')
-            
-            # Search for emails from FormSubmit
-            search_criteria = f'(FROM "{self.config["formsubmit_identifier"]}" UNSEEN)'
-            logger.info(f"Searching with criteria: {search_criteria}")
-            status, messages = mail.search(None, search_criteria)
-            
-            if status != 'OK':
-                logger.warning("No new messages or search failed")
-                return
-            
-            message_nums = messages[0].split()
-            if not message_nums:
-                logger.info("No new FormSubmit messages found")
-                return
-                
-            logger.info(f"Found {len(message_nums)} new FormSubmit messages")
-            
-            # Process each email
-            for num in message_nums:
-                status, data = mail.fetch(num, '(RFC822)')
-                if status != 'OK':
-                    logger.warning(f"Failed to fetch message {num}")
-                    continue
-                    
-                raw_email = data[0][1]
-                msg = email.message_from_bytes(raw_email)
-                
-                # Get message ID to avoid duplicate processing
-                message_id = msg.get('Message-ID', '')
-                if message_id in self.processed_ids:
-                    logger.info(f"Skipping already processed email: {message_id}")
-                    continue
-                
-                subject = msg.get('Subject', '')
-                logger.info(f"Processing email with subject: {subject}")
-                
-                # Get email content - try to get HTML content first, then plain text
-                email_content = ""
-                html_content = ""
-                
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        content_disposition = str(part.get("Content-Disposition"))
-                        
-                        # Skip attachments
-                        if "attachment" in content_disposition:
-                            continue
-                            
-                        if content_type == "text/html":
-                            html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        elif content_type == "text/plain" and not html_content:
-                            email_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                else:
-                    # Not multipart - could be plain text or HTML
-                    payload = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    if msg.get_content_type() == "text/html":
-                        html_content = payload
-                    else:
-                        email_content = payload
-                
-                # Prefer HTML content if available
-                content_to_parse = html_content if html_content else email_content
-                
-                # Log a portion of the content for debugging
-                logger.info(f"Email content preview (first 200 chars): {content_to_parse[:200]}...")
-                
-                # Extract form data, sender's email, name and message
-                form_data, sender_email, sender_name, message_content = self._extract_form_data_from_html(content_to_parse)
-                
-                logger.info(f"Extracted email: {sender_email}, name: {sender_name}")
-                logger.info(f"Form data fields: {form_data.keys()}")
-                
-                if sender_email:
-                    logger.info(f"Will send reply to: {sender_email}")
-                    
-                    # Generate AI response
-                    ai_response = self._generate_ai_response(sender_name, message_content, form_data)
-                    
-                    # Send reply to the original sender
-                    self._send_reply(sender_email, ai_response)
-                    
-                    # Mark as processed
-                    self.processed_ids.append(message_id)
-                    self._save_processed_ids()
-                    
-                    # Mark as seen
-                    mail.store(num, '+FLAGS', r'\Seen')
-                    logger.info(f"Processed and replied to email from: {sender_email}")
-                else:
-                    logger.warning("Could not extract sender email from FormSubmit message")
-            
-            # Close connection
-            mail.close()
-            mail.logout()
-            
-        except Exception as e:
-            logger.error(f"Error checking emails: {str(e)}")
+        # Add body to email
+        msg.attach(MIMEText(ai_response, 'plain'))
+        
+        # Create secure connection and send email
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls(context=context)
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+        
+        logger.info(f"Response email sent to {to_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+        return False
 
-    def _send_reply(self, recipient_email, response_body):
-        """Send AI-generated reply to the original sender."""
+def mark_as_read(mail, email_id):
+    """Mark an email as read"""
+    try:
+        mail.store(email_id, '+FLAGS', '\\Seen')
+        return True
+    except Exception as e:
+        logger.error(f"Error marking email as read: {e}")
+        return False
+
+def main():
+    """Main function to run the email bot"""
+    logger.info("Starting email bot")
+    
+    # Load environment variables for local development
+    load_environment()
+    
+    # Check for required environment variables
+    if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, OPENAI_API_KEY]):
+        logger.error("Missing required environment variables. Please set EMAIL_ADDRESS, EMAIL_PASSWORD, and OPENAI_API_KEY.")
+        return
+    
+    # Connect to inbox
+    mail = connect_to_inbox()
+    if not mail:
+        return
+    
+    # Get unread emails
+    unread_emails = get_unread_emails(mail)
+    
+    # Process each email
+    for email_data in unread_emails:
         try:
-            # Create message
-            msg = MIMEMultipart()
-            msg['From'] = self.config['email_address']
-            msg['To'] = recipient_ email
-            msg['Subject'] = self.config['auto_reply_subject']
+            # Parse contact form data
+            contact_data = parse_contact_form_email(email_data['body'])
             
-            # Attach body
-            msg.attach(MIMEText(response_body, 'plain'))
+            # Generate AI response
+            ai_response = generate_ai_response(contact_data)
             
-            # Connect to SMTP server and send email
-            with smtplib.SMTP(self.config['smtp_server'], self.config['smtp_port']) as server:
-                server.starttls()
-                server.login(self.config['email_address'], self.config['password'])
-                server.send_message(msg)
+            # Send response email
+            if contact_data['email']:
+                success = send_email_response(contact_data['email'], contact_data['name'], ai_response)
                 
-            logger.info(f"Sent AI-generated reply to {recipient_email}")
-            
+                # Mark as read if response was sent successfully
+                if success:
+                    mark_as_read(mail, email_data['id'])
         except Exception as e:
-            logger.error(f"Error sending reply: {str(e)}")
+            logger.error(f"Error processing email: {e}")
+    
+    # Logout
+    try:
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        logger.error(f"Error during logout: {e}")
+    
+    logger.info("Email bot finished")
 
 if __name__ == "__main__":
-    try:
-        bot = AIFormSubmitEmailBot()
-        bot.check_emails()
-        logger.info("AI Email bot run completed successfully")
-    except Exception as e:
-        logger.error(f"AI Email bot failed: {str(e)}")
+    main()
