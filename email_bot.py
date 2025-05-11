@@ -10,6 +10,7 @@ from datetime import datetime
 import openai
 import time
 import re
+from email.utils import parseaddr
 
 # Setup logging
 logging.basicConfig(
@@ -49,7 +50,7 @@ class AIFormSubmitEmailBot:
                 
                 # OpenAI settings
                 'openai_api_key': os.environ.get('OPENAI_API_KEY'),
-                'ai_model': os.environ.get('AI_MODEL', 'gpt-3.5-turbo'),
+                'ai_model': os.environ.get('AI_MODEL', 'gpt-4o'),
                 'response_tone': os.environ.get('RESPONSE_TONE', 'friendly and professional'),
                 
                 # Company info
@@ -100,33 +101,57 @@ class AIFormSubmitEmailBot:
         form_data = {}
         message_content = ""
         
+        # Get the email body content
+        email_body = ""
+        
         # Check if this is a multipart message
         if msg.is_multipart():
             for part in msg.walk():
                 content_type = part.get_content_type()
                 if content_type == "text/plain" or content_type == "text/html":
                     payload = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    email_body += payload
                     # Extract form data from payload
                     form_data.update(self._parse_formsubmit_content(payload))
         else:
             # Not multipart
             payload = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+            email_body = payload
             form_data.update(self._parse_formsubmit_content(payload))
         
-        # Try to find email, name and message in form data
+        # FormSubmit typically includes the original sender's email in the form data
+        # Look for "email:" field in the email body - this is the submitter's email
         sender_email = form_data.get('email')
         sender_name = form_data.get('name')
         message_content = form_data.get('message') or form_data.get('content') or ""
         
+        # If we couldn't find email in form data, try more aggressive pattern matching
         if not sender_email:
-            # As fallback, try to extract from headers
-            from_header = msg.get("From", "")
-            # Try to extract email from header
-            if "<" in from_header and ">" in from_header:
-                sender_email = from_header.split("<")[1].split(">")[0]
-            else:
-                sender_email = from_header
+            # Try to find any email pattern in the body
+            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            email_matches = re.findall(email_pattern, email_body)
+            
+            # Filter out the formsubmit.co emails to get the actual sender
+            for match in email_matches:
+                if self.config['formsubmit_identifier'] not in match.lower():
+                    sender_email = match
+                    break
         
+        # If still no sender email, check for "Reply-To" header (FormSubmit sometimes adds this)
+        if not sender_email and msg.get('Reply-To'):
+            reply_to = msg.get('Reply-To')
+            _, sender_email = parseaddr(reply_to)
+        
+        # Final fallback - extract any emails from headers except formsubmit.co ones
+        if not sender_email:
+            for header in ['From', 'Reply-To', 'Return-Path']:
+                if msg.get(header):
+                    _, extracted_email = parseaddr(msg.get(header))
+                    if extracted_email and self.config['formsubmit_identifier'] not in extracted_email.lower():
+                        sender_email = extracted_email
+                        break
+        
+        logger.info(f"Extracted email: {sender_email}, name: {sender_name}, message length: {len(message_content)}")
         return sender_email, sender_name, message_content, form_data
 
     def _parse_formsubmit_content(self, content):
@@ -143,21 +168,19 @@ class AIFormSubmitEmailBot:
                     form_data[key] = value
             
             # Second attempt: Look for common form patterns
-            if not form_data.get('email') and 'email:' in content.lower():
-                match = re.search(r'email:\s*([^\n]+)', content.lower())
-                if match:
-                    form_data['email'] = match.group(1).strip()
-                    
-            if not form_data.get('name') and 'name:' in content.lower():
-                match = re.search(r'name:\s*([^\n]+)', content.lower())
-                if match:
-                    form_data['name'] = match.group(1).strip()
-                    
-            if not form_data.get('message') and 'message:' in content.lower():
-                match = re.search(r'message:\s*([^\n]+)', content.lower())
-                if match:
-                    form_data['message'] = match.group(1).strip()
-                    
+            # FormSubmit typically formats submissions as field labels followed by values
+            email_match = re.search(r'(?i)email\s*:\s*([^\n@]+@[^\n]+)', content)
+            if email_match:
+                form_data['email'] = email_match.group(1).strip()
+                
+            name_match = re.search(r'(?i)(?:name|full[\s-]*name)\s*:\s*([^\n]+)', content)
+            if name_match:
+                form_data['name'] = name_match.group(1).strip()
+                
+            message_match = re.search(r'(?i)(?:message|comments?)\s*:\s*([^\n].+?)(?:\n\w+\s*:|$)', content, re.DOTALL)
+            if message_match:
+                form_data['message'] = message_match.group(1).strip()
+                
         except Exception as e:
             logger.error(f"Error parsing FormSubmit content: {str(e)}")
         
@@ -246,7 +269,9 @@ The {self.config['company_info']['team_name']}
             mail.select('inbox')
             
             # Search for emails from FormSubmit
-            status, messages = mail.search(None, f'(FROM "{self.config["formsubmit_identifier"]}" UNSEEN)')
+            search_criteria = f'(FROM "{self.config["formsubmit_identifier"]}" UNSEEN)'
+            logger.info(f"Searching with criteria: {search_criteria}")
+            status, messages = mail.search(None, search_criteria)
             
             if status != 'OK':
                 logger.warning("No new messages or search failed")
@@ -257,6 +282,8 @@ The {self.config['company_info']['team_name']}
                 logger.info("No new FormSubmit messages found")
                 return
                 
+            logger.info(f"Found {len(message_nums)} new FormSubmit messages")
+            
             # Process each email
             for num in message_nums:
                 status, data = mail.fetch(num, '(RFC822)')
@@ -273,10 +300,15 @@ The {self.config['company_info']['team_name']}
                     logger.info(f"Skipping already processed email: {message_id}")
                     continue
                 
+                subject = msg.get('Subject', '')
+                logger.info(f"Processing email with subject: {subject}")
+                
                 # Extract sender information and message content from FormSubmit email
                 sender_email, sender_name, message_content, form_data = self._extract_sender_info(msg)
                 
                 if sender_email:
+                    logger.info(f"Will send reply to: {sender_email}")
+                    
                     # Generate AI response
                     ai_response = self._generate_ai_response(sender_name, message_content, form_data)
                     
