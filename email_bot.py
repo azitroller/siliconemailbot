@@ -65,25 +65,38 @@ class AIFormSubmitEmailBot:
     def _parse_formsubmit_content(self, content):
         form_data = {}
         try:
-            lines = content.split('\n')
-            for line in lines:
-                if ':' in line and '@formsubmit.co' not in line:
-                    key, value = line.split(':', 1)
-                    form_data[key.strip().lower()] = value.strip()
-            email_match = re.search(r'(?i)email\s*:\s*([^\n@]+@[^\n]+)', content)
+            # First try to find email in common form field patterns
+            email_match = re.search(r'(?i)(?:email|e-?mail)\s*[:=]\s*([^\n@]+@[^\n]+)', content)
             if email_match:
                 form_data['email'] = email_match.group(1).strip()
-            name_match = re.search(r'(?i)(?:name|full[\s-]*name)\s*:\s*([^\n]+)', content)
-            if name_match:
-                form_data['name'] = name_match.group(1).strip()
-            message_match = re.search(r'(?i)(?:message|comments?)\s*:\s*([^\n].+?)(?:\n\w+\s*:|$)', content, re.DOTALL)
-            if message_match:
-                form_data['message'] = message_match.group(1).strip()
+            
+            # If no email found, look for any email in the content that's not formsubmit
             if not form_data.get('email'):
                 email_pattern = r'(?i)(?<!formsubmit\.co)[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
                 matches = re.findall(email_pattern, content)
                 if matches:
                     form_data['email'] = matches[0]
+
+            # Extract name
+            name_match = re.search(r'(?i)(?:name|full[\s-]*name)\s*[:=]\s*([^\n]+)', content)
+            if name_match:
+                form_data['name'] = name_match.group(1).strip()
+
+            # Extract message
+            message_match = re.search(r'(?i)(?:message|comments?|question)\s*[:=]\s*([^\n].+?)(?:\n\w+\s*[:=]|$)', content, re.DOTALL)
+            if message_match:
+                form_data['message'] = message_match.group(1).strip()
+
+            # Parse other key-value pairs
+            lines = content.split('\n')
+            for line in lines:
+                if ':' in line or '=' in line:
+                    separator = ':' if ':' in line else '='
+                    key, value = line.split(separator, 1)
+                    key = key.strip().lower()
+                    if key not in ['email', 'name', 'message']:  # Don't overwrite already found fields
+                        form_data[key] = value.strip()
+
         except Exception as e:
             logger.error(f"Error parsing FormSubmit content: {str(e)}")
         return form_data
@@ -93,6 +106,8 @@ class AIFormSubmitEmailBot:
         sender_name = None
         form_data = {}
         email_body = ""
+        
+        # First parse the email body for form data
         if msg.is_multipart():
             for part in msg.walk():
                 if part.get_content_type() in ["text/plain", "text/html"]:
@@ -104,20 +119,34 @@ class AIFormSubmitEmailBot:
             email_body = payload
             form_data.update(self._parse_formsubmit_content(payload))
 
+        # Get email from form data first
         sender_email = form_data.get('email')
         sender_name = form_data.get('name')
         message_content = form_data.get('message') or form_data.get('content') or ""
 
-        if not sender_email and msg.get('Reply-To'):
-            _, sender_email = parseaddr(msg.get('Reply-To'))
-
+        # If no email in form data, check headers but exclude formsubmit.co addresses
         if not sender_email:
-            for header in ['From', 'Return-Path']:
-                if msg.get(header):
-                    _, extracted_email = parseaddr(msg.get(header))
-                    if extracted_email and self.config['formsubmit_identifier'] not in extracted_email.lower():
-                        sender_email = extracted_email
-                        break
+            # Check Reply-To header first (but exclude formsubmit addresses)
+            reply_to = msg.get('Reply-To')
+            if reply_to:
+                _, reply_to_email = parseaddr(reply_to)
+                if reply_to_email and self.config['formsubmit_identifier'] not in reply_to_email.lower():
+                    sender_email = reply_to_email
+
+            # If still no email, check From header (but exclude formsubmit addresses)
+            if not sender_email:
+                from_header = msg.get('From')
+                if from_header:
+                    _, from_email = parseaddr(from_header)
+                    if from_email and self.config['formsubmit_identifier'] not in from_email.lower():
+                        sender_email = from_email
+
+        # If we still don't have an email, look for any email in the body that's not formsubmit
+        if not sender_email:
+            email_pattern = r'(?i)(?<!formsubmit\.co)[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+            matches = re.findall(email_pattern, email_body)
+            if matches:
+                sender_email = matches[0]
 
         logger.info(f"Extracted email: {sender_email}, name: {sender_name}, message length: {len(message_content)}")
         return sender_email, sender_name, message_content, form_data
