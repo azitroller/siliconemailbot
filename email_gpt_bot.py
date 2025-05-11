@@ -20,35 +20,57 @@ logging.basicConfig(
 logger = logging.getLogger('email_bot')
 
 class AIFormSubmitEmailBot:
-    def __init__(self, config_file='config.json'):
-        """Initialize the email bot with configuration from a JSON file."""
-        self.config = self._load_config(config_file)
+    def __init__(self):
+        """Initialize the email bot with configuration from environment variables."""
+        self.config = self._load_config()
         self.processed_ids_file = 'processed_emails.json'
         self.processed_ids = self._load_processed_ids()
         
         # Initialize OpenAI client
         openai.api_key = self.config['openai_api_key']
 
-    def _load_config(self, config_file):
-        """Load configuration from JSON file."""
+    def _load_config(self):
+        """Load configuration from environment variables."""
         try:
-            with open(config_file, 'r') as f:
-                config = json.load(f)
+            config = {
+                # Email server settings
+                'imap_server': os.environ.get('IMAP_SERVER'),
+                'imap_port': int(os.environ.get('IMAP_PORT', 993)),
+                'smtp_server': os.environ.get('SMTP_SERVER'),
+                'smtp_port': int(os.environ.get('SMTP_PORT', 587)),
                 
-            required_fields = [
-                'imap_server', 'imap_port', 'smtp_server', 'smtp_port',
-                'email_address', 'password', 'formsubmit_identifier',
-                'auto_reply_subject', 'openai_api_key', 'ai_model',
-                'company_info', 'response_tone'
-            ]
+                # Email credentials
+                'email_address': os.environ.get('EMAIL_ADDRESS'),
+                'password': os.environ.get('EMAIL_PASSWORD'),
+                
+                # FormSubmit settings
+                'formsubmit_identifier': os.environ.get('FORMSUBMIT_IDENTIFIER', 'formsubmit.co'),
+                'auto_reply_subject': os.environ.get('AUTO_REPLY_SUBJECT', 'Thank you for contacting us'),
+                
+                # OpenAI settings
+                'openai_api_key': os.environ.get('OPENAI_API_KEY'),
+                'ai_model': os.environ.get('AI_MODEL', 'gpt-3.5-turbo'),
+                'response_tone': os.environ.get('RESPONSE_TONE', 'friendly and professional'),
+                
+                # Company info
+                'company_info': {
+                    'name': os.environ.get('COMPANY_NAME', 'Our Company'),
+                    'description': os.environ.get('COMPANY_DESCRIPTION', 'company that values your inquiry'),
+                    'team_name': os.environ.get('TEAM_NAME', 'Customer Support Team')
+                }
+            }
             
-            for field in required_fields:
-                if field not in config:
-                    raise KeyError(f"Missing required configuration field: {field}")
-                    
+            # Verify required fields
+            required_fields = ['imap_server', 'smtp_server', 'email_address', 'password', 'openai_api_key']
+            missing_fields = [field for field in required_fields if not config[field]]
+            
+            if missing_fields:
+                raise ValueError(f"Missing required environment variables: {', '.join(missing_fields)}")
+                
             return config
+            
         except Exception as e:
-            logger.error(f"Error loading configuration: {str(e)}")
+            logger.error(f"Error loading configuration from environment variables: {str(e)}")
             raise
 
     def _load_processed_ids(self):
