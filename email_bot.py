@@ -8,7 +8,6 @@ import json
 import logging
 from datetime import datetime
 import openai
-import time
 import re
 from email.utils import parseaddr
 
@@ -38,7 +37,7 @@ class AIFormSubmitEmailBot:
             'formsubmit_identifier': os.environ.get('FORMSUBMIT_IDENTIFIER', 'formsubmit.co'),
             'auto_reply_subject': os.environ.get('AUTO_REPLY_SUBJECT', 'Thank you for contacting us'),
             'openai_api_key': os.environ.get('OPENAI_API_KEY'),
-            'ai_model': os.environ.get('AI_MODEL', 'gpt-4o'),
+            'ai_model': os.environ.get('AI_MODEL', 'gpt-4'),
             'response_tone': os.environ.get('RESPONSE_TONE', 'friendly and professional'),
             'company_info': {
                 'name': os.environ.get('COMPANY_NAME', 'Our Company'),
@@ -65,37 +64,34 @@ class AIFormSubmitEmailBot:
     def _parse_formsubmit_content(self, content):
         form_data = {}
         try:
-            # First try to find email in common form field patterns
-            email_match = re.search(r'(?i)(?:email|e-?mail)\s*[:=]\s*([^\n@]+@[^\n]+)', content)
-            if email_match:
-                form_data['email'] = email_match.group(1).strip()
+            # Split into lines and remove empty lines
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
             
-            # If no email found, look for any email in the content that's not formsubmit
-            if not form_data.get('email'):
+            # Handle both tab-separated and newline-separated formats
+            if 'Name\tValue' in content:
+                # Tab-separated format (like in your example)
+                start_idx = lines.index('Name\tValue') + 1 if 'Name\tValue' in lines else 0
+                for line in lines[start_idx:]:
+                    if '\t' in line:
+                        name, value = line.split('\t', 1)
+                        form_data[name.strip().lower()] = value.strip()
+            else:
+                # Newline-separated format (common alternative)
+                current_field = None
+                for line in lines:
+                    if line.endswith(':'):
+                        current_field = line[:-1].strip().lower()
+                    elif current_field:
+                        form_data[current_field] = line.strip()
+                        current_field = None
+            
+            # Special handling for email field if not found
+            if 'email' not in form_data:
+                # Look for any email pattern in the content that's not formsubmit
                 email_pattern = r'(?i)(?<!formsubmit\.co)[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
                 matches = re.findall(email_pattern, content)
                 if matches:
                     form_data['email'] = matches[0]
-
-            # Extract name
-            name_match = re.search(r'(?i)(?:name|full[\s-]*name)\s*[:=]\s*([^\n]+)', content)
-            if name_match:
-                form_data['name'] = name_match.group(1).strip()
-
-            # Extract message
-            message_match = re.search(r'(?i)(?:message|comments?|question)\s*[:=]\s*([^\n].+?)(?:\n\w+\s*[:=]|$)', content, re.DOTALL)
-            if message_match:
-                form_data['message'] = message_match.group(1).strip()
-
-            # Parse other key-value pairs
-            lines = content.split('\n')
-            for line in lines:
-                if ':' in line or '=' in line:
-                    separator = ':' if ':' in line else '='
-                    key, value = line.split(separator, 1)
-                    key = key.strip().lower()
-                    if key not in ['email', 'name', 'message']:  # Don't overwrite already found fields
-                        form_data[key] = value.strip()
 
         except Exception as e:
             logger.error(f"Error parsing FormSubmit content: {str(e)}")
@@ -110,14 +106,21 @@ class AIFormSubmitEmailBot:
         # First parse the email body for form data
         if msg.is_multipart():
             for part in msg.walk():
-                if part.get_content_type() in ["text/plain", "text/html"]:
-                    payload = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    email_body += payload
-                    form_data.update(self._parse_formsubmit_content(payload))
+                content_type = part.get_content_type()
+                if content_type in ["text/plain", "text/html"]:
+                    try:
+                        payload = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        email_body += payload
+                        form_data.update(self._parse_formsubmit_content(payload))
+                    except Exception as e:
+                        logger.error(f"Error decoding part: {str(e)}")
         else:
-            payload = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-            email_body = payload
-            form_data.update(self._parse_formsubmit_content(payload))
+            try:
+                payload = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                email_body = payload
+                form_data.update(self._parse_formsubmit_content(payload))
+            except Exception as e:
+                logger.error(f"Error decoding payload: {str(e)}")
 
         # Get email from form data first
         sender_email = form_data.get('email')
@@ -148,7 +151,8 @@ class AIFormSubmitEmailBot:
             if matches:
                 sender_email = matches[0]
 
-        logger.info(f"Extracted email: {sender_email}, name: {sender_name}, message length: {len(message_content)}")
+        logger.info(f"Extracted form data: {form_data}")
+        logger.info(f"Using email: {sender_email}, name: {sender_name}")
         return sender_email, sender_name, message_content, form_data
 
     def _generate_ai_response(self, name, message_content, form_data):
@@ -180,27 +184,46 @@ class AIFormSubmitEmailBot:
             mail = imaplib.IMAP4_SSL(self.config['imap_server'], self.config['imap_port'])
             mail.login(self.config['email_address'], self.config['password'])
             mail.select('inbox')
+            
+            # Search for unseen emails from formsubmit
             status, messages = mail.search(None, f'(FROM "{self.config["formsubmit_identifier"]}" UNSEEN)')
             if status != 'OK':
+                logger.info("No new formsubmit emails found")
                 return
+            
             for num in messages[0].split():
-                status, data = mail.fetch(num, '(RFC822)')
-                if status != 'OK':
-                    continue
-                raw_email = data[0][1]
-                msg = email.message_from_bytes(raw_email)
-                message_id = msg.get('Message-ID', '')
-                if message_id in self.processed_ids:
-                    continue
-                sender_email, sender_name, message_content, form_data = self._extract_sender_info(msg)
-                if sender_email:
+                try:
+                    status, data = mail.fetch(num, '(RFC822)')
+                    if status != 'OK':
+                        continue
+                    
+                    raw_email = data[0][1]
+                    msg = email.message_from_bytes(raw_email)
+                    message_id = msg.get('Message-ID', '')
+                    
+                    if message_id in self.processed_ids:
+                        continue
+                    
+                    sender_email, sender_name, message_content, form_data = self._extract_sender_info(msg)
+                    
+                    if not sender_email:
+                        logger.warning(f"No valid sender email found for message {message_id}")
+                        continue
+                    
                     ai_response = self._generate_ai_response(sender_name, message_content, form_data)
                     self._send_reply(sender_email, ai_response)
+                    
                     self.processed_ids.append(message_id)
                     self._save_processed_ids()
                     mail.store(num, '+FLAGS', r'\Seen')
+                    
+                except Exception as e:
+                    logger.error(f"Error processing email: {str(e)}")
+                    continue
+            
             mail.close()
             mail.logout()
+            
         except Exception as e:
             logger.error(f"Error checking emails: {str(e)}")
 
@@ -211,13 +234,16 @@ class AIFormSubmitEmailBot:
             msg['To'] = recipient_email
             msg['Subject'] = self.config['auto_reply_subject']
             msg.attach(MIMEText(response_body, 'plain'))
+            
             with smtplib.SMTP(self.config['smtp_server'], self.config['smtp_port']) as server:
                 server.starttls()
                 server.login(self.config['email_address'], self.config['password'])
                 server.send_message(msg)
-            logger.info(f"Sent AI-generated reply to {recipient_email}")
+            
+            logger.info(f"Successfully sent reply to {recipient_email}")
+            
         except Exception as e:
-            logger.error(f"Error sending reply: {str(e)}")
+            logger.error(f"Error sending reply to {recipient_email}: {str(e)}")
 
 if __name__ == "__main__":
     try:
