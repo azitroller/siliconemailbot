@@ -5,7 +5,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
-from openai import OpenAI  # Updated import for v1.0+
+import anthropic  # Changed from OpenAI to Anthropic
 from dotenv import load_dotenv
 import logging
 
@@ -15,8 +15,8 @@ load_dotenv()
 # === Config ===
 EMAIL_ADDRESS = os.getenv("EMAIL")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)  # Updated client initialization
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # Changed from OPENAI_API_KEY
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)  # Anthropic client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,22 +58,21 @@ def fetch_latest_email():
         logging.error(f"Error fetching email: {str(e)}", exc_info=True)
         return None
 
-# === Generate a reply using GPT-4 ===
-def generate_gpt_reply(body_text):
+# === Generate a reply using Claude 3 ===
+def generate_ai_reply(body_text):  # Renamed from generate_gpt_reply
     try:
-        response = client.chat.completions.create(  # Updated API call
-            model="gpt-4",
+        response = client.messages.create(
+            model="claude-3-sonnet-20240229",  # or "claude-3-opus-20240229"
+            max_tokens=300,
+            system="You are a polite and professional assistant replying to website contact form messages.",
             messages=[
-                {"role": "system", "content": "You are a polite and professional assistant replying to website contact form messages."},
                 {"role": "user", "content": body_text}
-            ],
-            temperature=0.7,
-            max_tokens=300
+            ]
         )
-        return response.choices[0].message.content.strip()  # Updated response access
+        return response.content[0].text.strip()
 
     except Exception as e:
-        logging.error(f"Error generating GPT reply: {str(e)}", exc_info=True)
+        logging.error(f"Error generating AI reply: {str(e)}", exc_info=True)
         return None
 
 # === Send the reply email ===
@@ -113,9 +112,9 @@ def main():
         sender, subject, body = email_data
         logging.info(f"New email from: {sender} | Subject: {subject}")
 
-        reply = generate_gpt_reply(body)
+        reply = generate_ai_reply(body)  # Updated function call
         if not reply:
-            logging.error("Failed to generate GPT reply")
+            logging.error("Failed to generate AI reply")
             return
 
         logging.info(f"Generated reply (first 100 chars): {reply[:100]}...")
