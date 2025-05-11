@@ -9,14 +9,32 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import logging
 
+# Initialize with basic config first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
 
 # === Configuration ===
-EMAIL_ADDRESS = os.getenv("EMAIL")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+try:
+    EMAIL_ADDRESS = os.environ["EMAIL"]
+    EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+    OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+    
+    # Initialize OpenAI client with explicit HTTPX config
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        # Prevents proxy-related errors
+        http_client=None,
+        timeout=30.0
+    )
+except KeyError as e:
+    logger.error(f"Missing environment variable: {str(e)}")
+    exit(1)
+except Exception as e:
+    logger.error(f"Initialization error: {str(e)}")
+    exit(1)
 
 # Configure logging
 logging.basicConfig(
